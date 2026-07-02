@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from review_pr import annotate_patch, parse_patch, review_with_claude, validate_comments
+from review_pr import annotate_patch, parse_patch, review_with_gemini, validate_comments
 
 NEW_FILE_PATCH = """@@ -0,0 +1,4 @@
 +def add(a, b):
@@ -74,29 +74,34 @@ class TestValidateComments(unittest.TestCase):
         self.assertEqual(dropped, comments)
 
 
-class TestReviewWithClaude(unittest.TestCase):
-    def test_extracts_tool_use_input(self):
-        expected_input = {
+class TestReviewWithGemini(unittest.TestCase):
+    def setUp(self):
+        self.env_patch = patch.dict("os.environ", {"GEMINI_API_KEY": "fake-key"})
+        self.env_patch.start()
+        self.addCleanup(self.env_patch.stop)
+
+    def test_extracts_function_call_args(self):
+        expected_args = {
             "summary": "Adds an add() helper.",
             "comments": [
                 {"path": "calculator.py", "line": 2, "severity": "nit", "comment": "Add a docstring."}
             ],
         }
-        fake_block = SimpleNamespace(type="tool_use", name="submit_code_review", input=expected_input)
-        fake_response = SimpleNamespace(content=[fake_block])
+        fake_call = SimpleNamespace(name="submit_code_review", args=expected_args)
+        fake_response = SimpleNamespace(function_calls=[fake_call])
 
-        with patch("review_pr.Anthropic") as mock_anthropic:
-            mock_anthropic.return_value.messages.create.return_value = fake_response
-            result = review_with_claude("### calculator.py (added)\n1 + def add(a, b):")
+        with patch("review_pr.genai.Client") as mock_client_cls:
+            mock_client_cls.return_value.models.generate_content.return_value = fake_response
+            result = review_with_gemini("### calculator.py (added)\n1 + def add(a, b):")
 
-        self.assertEqual(result, expected_input)
+        self.assertEqual(result, expected_args)
 
-    def test_raises_if_no_tool_use_block(self):
-        fake_response = SimpleNamespace(content=[SimpleNamespace(type="text", text="oops")])
-        with patch("review_pr.Anthropic") as mock_anthropic:
-            mock_anthropic.return_value.messages.create.return_value = fake_response
+    def test_raises_if_no_function_call(self):
+        fake_response = SimpleNamespace(function_calls=None)
+        with patch("review_pr.genai.Client") as mock_client_cls:
+            mock_client_cls.return_value.models.generate_content.return_value = fake_response
             with self.assertRaises(RuntimeError):
-                review_with_claude("some diff")
+                review_with_gemini("some diff")
 
 
 if __name__ == "__main__":
