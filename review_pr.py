@@ -4,13 +4,16 @@ import re
 import sys
 from dataclasses import dataclass
 
-from anthropic import Anthropic
 from dotenv import load_dotenv
 from github import Github
+from google import genai
+from google.genai import types
 
 load_dotenv()
 
-MODEL = "claude-sonnet-4-6"
+# Free-tier Gemini model. Check https://aistudio.google.com/rate-limit for current
+# free-tier availability if this model stops working.
+MODEL = "gemini-2.5-flash"
 
 SYSTEM_PROMPT = """You are an expert code reviewer embedded in a CI pipeline. You will be shown a \
 pull request diff, file by file. Each shown line is prefixed with its line number in the NEW \
@@ -28,44 +31,42 @@ maintainability/performance issues. Do not nitpick style that a linter would alr
 - If the diff has nothing worth flagging, return an empty `comments` array.
 """
 
-REVIEW_TOOL = {
-    "name": "submit_code_review",
-    "description": "Submit a structured code review for the pull request diff.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "summary": {
-                "type": "string",
-                "description": "Overall summary and assessment of the PR (2-4 sentences).",
-            },
-            "comments": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "path": {
-                            "type": "string",
-                            "description": "File path exactly as shown in the diff header.",
-                        },
-                        "line": {
-                            "type": "integer",
-                            "description": "New-file line number this comment applies to.",
-                        },
-                        "severity": {
-                            "type": "string",
-                            "enum": ["bug", "security", "performance", "suggestion", "nit"],
-                        },
-                        "comment": {
-                            "type": "string",
-                            "description": "The actionable feedback for this line.",
-                        },
+REVIEW_TOOL_NAME = "submit_code_review"
+
+REVIEW_TOOL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "summary": {
+            "type": "string",
+            "description": "Overall summary and assessment of the PR (2-4 sentences).",
+        },
+        "comments": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path exactly as shown in the diff header.",
                     },
-                    "required": ["path", "line", "severity", "comment"],
+                    "line": {
+                        "type": "integer",
+                        "description": "New-file line number this comment applies to.",
+                    },
+                    "severity": {
+                        "type": "string",
+                        "enum": ["bug", "security", "performance", "suggestion", "nit"],
+                    },
+                    "comment": {
+                        "type": "string",
+                        "description": "The actionable feedback for this line.",
+                    },
                 },
+                "required": ["path", "line", "severity", "comment"],
             },
         },
-        "required": ["summary", "comments"],
     },
+    "required": ["summary", "comments"],
 }
 
 SEVERITY_LABELS = {
@@ -144,27 +145,44 @@ def build_review_prompt(repo, pr) -> tuple[str, dict[str, set[int]]]:
     return "\n".join(sections), commentable
 
 
-def review_with_claude(diff_text: str) -> dict:
-    client = Anthropic()
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=8192,
-        system=SYSTEM_PROMPT,
-        tools=[REVIEW_TOOL],
-        tool_choice={"type": "tool", "name": "submit_code_review"},
-        messages=[
-            {
-                "role": "user",
-                "content": f"Review this pull request diff:\n\n{diff_text}",
-            }
-        ],
+def review_with_gemini(diff_text: str) -> dict:
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        print("Error: GEMINI_API_KEY environment variable not set", file=sys.stderr)
+        sys.exit(1)
+
+    client = genai.Client(api_key=api_key)
+    tool = types.Tool(
+        function_declarations=[
+            types.FunctionDeclaration(
+                name=REVIEW_TOOL_NAME,
+                description="Submit a structured code review for the pull request diff.",
+                parameters_json_schema=REVIEW_TOOL_SCHEMA,
+            )
+        ]
     )
 
-    for block in response.content:
-        if block.type == "tool_use" and block.name == "submit_code_review":
-            return block.input
+    response = client.models.generate_content(
+        model=MODEL,
+        contents=f"Review this pull request diff:\n\n{diff_text}",
+        config=types.GenerateContentConfig(
+            system_instruction=SYSTEM_PROMPT,
+            max_output_tokens=8192,
+            tools=[tool],
+            tool_config=types.ToolConfig(
+                function_calling_config=types.FunctionCallingConfig(
+                    mode="ANY",
+                    allowed_function_names=[REVIEW_TOOL_NAME],
+                )
+            ),
+        ),
+    )
 
-    raise RuntimeError("Claude did not return a submit_code_review tool call")
+    for call in response.function_calls or []:
+        if call.name == REVIEW_TOOL_NAME:
+            return call.args
+
+    raise RuntimeError("Gemini did not return a submit_code_review function call")
 
 
 def validate_comments(raw_comments: list[dict], commentable: dict[str, set[int]]) -> tuple[list[dict], list[dict]]:
@@ -229,8 +247,8 @@ def main():
         print("No diff found for this PR.", file=sys.stderr)
         sys.exit(1)
 
-    print("Sending diff to Claude for structured review...")
-    result = review_with_claude(diff_text)
+    print("Sending diff to Gemini for structured review...")
+    result = review_with_gemini(diff_text)
 
     valid, dropped = validate_comments(result.get("comments", []), commentable)
     if dropped:
